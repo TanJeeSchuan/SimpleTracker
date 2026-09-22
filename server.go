@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html/template"
 	"io"
 	"log"
 	"net"
@@ -23,6 +22,8 @@ type Server struct {
 	Logger  *log.Logger
 }
 
+const browserSessionCookie = "tracker_session"
+
 func NewServer(store *Store, baseURL, version string) *Server {
 	return &Server{Store: store, BaseURL: strings.TrimRight(baseURL, "/"), Version: version, Logger: log.Default()}
 }
@@ -34,6 +35,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/readyz", s.health)
 	mux.HandleFunc("/version", s.version)
 	mux.HandleFunc("/login", s.login)
+	mux.Handle("/assets/", browserAssetsHandler())
 	mux.HandleFunc("/api/v1/", s.api)
 	mux.HandleFunc("/", s.browser)
 	return requestLogger(mux, s.Logger)
@@ -54,11 +56,11 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
-	if s.Store == nil || s.Store.db == nil {
+	if s.Store == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "unavailable"})
 		return
 	}
-	if err := s.Store.db.PingContext(r.Context()); err != nil {
+	if err := s.Store.Ping(r.Context()); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "unavailable"})
 		return
 	}
@@ -144,12 +146,15 @@ func (s *Server) authenticateRequest(w http.ResponseWriter, r *http.Request) (Au
 	if secret == "" {
 		secret = strings.TrimSpace(r.Header.Get("X-API-Key"))
 	}
-	if secret == "" {
-		if cookie, err := r.Cookie("tracker_key"); err == nil {
-			secret = cookie.Value
-		}
+	var key APIKey
+	var err error
+	if secret != "" {
+		key, err = s.Store.Authenticate(r.Context(), secret)
+	} else if cookie, cookieErr := r.Cookie(browserSessionCookie); cookieErr == nil {
+		key, err = s.Store.AuthenticateBrowserSession(r.Context(), cookie.Value)
+	} else {
+		err = ErrUnauthorized
 	}
-	key, err := s.Store.Authenticate(r.Context(), secret)
 	if err != nil {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="simpletracker"`)
 		writeError(w, http.StatusUnauthorized, "unauthorized", "a valid API key is required")
@@ -879,116 +884,4 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 
 func writeError(w http.ResponseWriter, status int, code, message string) {
 	writeJSON(w, status, map[string]any{"error": map[string]string{"code": code, "message": message}})
-}
-
-func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodGet {
-		writeHTML(w, http.StatusOK, loginPage)
-		return
-	}
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
-		return
-	}
-	if err := r.ParseForm(); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-	if _, err := s.Store.Authenticate(r.Context(), r.FormValue("api_key")); err != nil {
-		writeHTML(w, http.StatusUnauthorized, loginPageWithError)
-		return
-	}
-	http.SetCookie(w, &http.Cookie{Name: "tracker_key", Value: r.FormValue("api_key"), HttpOnly: true, SameSite: http.SameSiteLaxMode, Path: "/"})
-	http.Redirect(w, r, "/", http.StatusSeeOther)
-}
-
-func (s *Server) browser(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/" {
-		if _, ok := s.browserAuth(r); !ok {
-			http.Redirect(w, r, "/login", http.StatusSeeOther)
-			return
-		}
-		projects, err := s.Store.ListProjects(r.Context())
-		if err != nil {
-			writeHTML(w, http.StatusInternalServerError, "<h1>Storage error</h1>")
-			return
-		}
-		writeHTML(w, http.StatusOK, renderProjectIndex(projects))
-		return
-	}
-	parts := splitPath(strings.TrimPrefix(r.URL.Path, "/"))
-	if len(parts) == 2 && parts[0] == "projects" {
-		if _, ok := s.browserAuth(r); !ok {
-			http.Redirect(w, r, "/login", http.StatusSeeOther)
-			return
-		}
-		project, err := s.Store.GetProject(r.Context(), parts[1])
-		if errors.Is(err, ErrNotFound) {
-			writeHTML(w, http.StatusNotFound, "<h1>Project not found</h1>")
-			return
-		}
-		if err != nil {
-			writeHTML(w, http.StatusInternalServerError, "<h1>Storage error</h1>")
-			return
-		}
-		issues, err := s.Store.QueryIssues(r.Context(), IssueFilters{ProjectID: project.ID})
-		if err != nil {
-			writeHTML(w, http.StatusInternalServerError, "<h1>Storage error</h1>")
-			return
-		}
-		writeHTML(w, http.StatusOK, renderProjectBoard(project, issues))
-		return
-	}
-	if len(parts) == 4 && parts[0] == "projects" && parts[2] == "issues" && isNumber(parts[3]) {
-		if _, ok := s.browserAuth(r); !ok {
-			http.Redirect(w, r, "/login", http.StatusSeeOther)
-			return
-		}
-		issue, err := s.Store.GetIssue(r.Context(), parts[1]+"#"+parts[3])
-		if errors.Is(err, ErrNotFound) {
-			writeHTML(w, http.StatusNotFound, "<h1>Issue not found</h1>")
-			return
-		}
-		if err != nil {
-			writeHTML(w, http.StatusInternalServerError, "<h1>Storage error</h1>")
-			return
-		}
-		writeHTML(w, http.StatusOK, renderInteractiveIssuePage(issue))
-		return
-	}
-	writeHTML(w, http.StatusNotFound, "<h1>Not found</h1>")
-}
-
-func (s *Server) browserAuth(r *http.Request) (APIKey, bool) {
-	cookie, err := r.Cookie("tracker_key")
-	if err != nil {
-		return APIKey{}, false
-	}
-	key, err := s.Store.Authenticate(r.Context(), cookie.Value)
-	return key, err == nil
-}
-
-func writeHTML(w http.ResponseWriter, status int, body string) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(status)
-	_, _ = io.WriteString(w, body)
-}
-
-var loginPage = `<!doctype html><meta charset="utf-8"><title>SimpleTracker sign in</title><style>body{font:16px system-ui;max-width:36rem;margin:8rem auto;padding:1rem;background:#f6f7f9}form{display:grid;gap:.75rem}input,button{font:inherit;padding:.7rem}button{cursor:pointer}</style><h1>SimpleTracker</h1><p>Use an API key to continue.</p><form method="post"><label>API key <input name="api_key" type="password" autocomplete="off" required></label><button>Sign in</button></form>`
-var loginPageWithError = `<!doctype html><meta charset="utf-8"><title>SimpleTracker sign in</title><style>body{font:16px system-ui;max-width:36rem;margin:8rem auto;padding:1rem;background:#f6f7f9}form{display:grid;gap:.75rem}input,button{font:inherit;padding:.7rem}button{cursor:pointer}.error{color:#a00}</style><h1>SimpleTracker</h1><p class="error">That API key was not accepted.</p><form method="post"><label>API key <input name="api_key" type="password" autocomplete="off" required></label><button>Sign in</button></form>`
-
-func renderProjectIndex(projects []Project) string {
-	var b strings.Builder
-	b.WriteString(`<!doctype html><meta charset="utf-8"><title>SimpleTracker</title><style>body{font:16px system-ui;max-width:56rem;margin:3rem auto;padding:1rem}a{color:#1769aa}.project{padding:1rem;border:1px solid #ddd;border-radius:.5rem;margin:.5rem 0}.project a{display:block;text-decoration:none;color:inherit}</style><h1>Projects</h1>`)
-	if len(projects) == 0 {
-		b.WriteString("<p>No projects yet.</p>")
-	}
-	for _, project := range projects {
-		b.WriteString(`<div class="project"><a href="/projects/` + template.HTMLEscapeString(url.PathEscape(project.Slug)) + `"><strong>` + template.HTMLEscapeString(project.Name) + `</strong> <code>` + template.HTMLEscapeString(project.Slug) + `</code><small> Open swimlane board →</small></a></div>`)
-	}
-	return b.String()
-}
-
-func renderIssuePage(issue Issue) string {
-	return renderInteractiveIssuePage(issue)
 }

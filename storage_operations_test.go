@@ -353,7 +353,7 @@ func TestV1MigrationReplacesHistoricalIndexAndSurvivesRestartRestore(t *testing.
 	}
 	assertV1State(store)
 
-	rows, err := store.db.Query("PRAGMA index_info(issues_project_state_idx)")
+	rows, err := store.writeDB.Query("PRAGMA index_info(issues_project_state_idx)")
 	if err != nil {
 		store.Close()
 		t.Fatal(err)

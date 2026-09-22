@@ -22,6 +22,7 @@ func TestBrowserProjectBoardGroupsGraphAndDerivedColumns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sessionToken := mustBrowserSession(t, store, key.ID)
 	project, err := store.CreateProject(t.Context(), "Wayfinder", "wayfinder")
 	if err != nil {
 		t.Fatal(err)
@@ -72,7 +73,7 @@ func TestBrowserProjectBoardGroupsGraphAndDerivedColumns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request.AddCookie(&http.Cookie{Name: "tracker_key", Value: key.Secret})
+	request.AddCookie(&http.Cookie{Name: browserSessionCookie, Value: sessionToken})
 	response, err := server.Client().Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -97,8 +98,8 @@ func TestBrowserProjectBoardGroupsGraphAndDerivedColumns(t *testing.T) {
 		"data-filter-updated-until",
 		"data-filter-age",
 		"data-board-message",
-		"Cross-column and cross-lane drops are disabled",
-		"/position",
+		"/assets/browser.css",
+		"/assets/board.js",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("board response missing %q: %s", want, body)
@@ -116,6 +117,7 @@ func TestBrowserInteractionAcceptance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sessionToken := mustBrowserSession(t, store, key.ID)
 	project, err := store.CreateProject(t.Context(), "Acceptance", "acceptance")
 	if err != nil {
 		t.Fatal(err)
@@ -137,7 +139,7 @@ func TestBrowserInteractionAcceptance(t *testing.T) {
 		t.Fatal(err)
 	}
 	old := time.Now().UTC().Add(-8 * 24 * time.Hour)
-	if _, err := store.db.ExecContext(t.Context(), "UPDATE issues SET updated_at=? WHERE id=?", old.Format(time.RFC3339Nano), loose.ID); err != nil {
+	if _, err := store.writeDB.ExecContext(t.Context(), "UPDATE issues SET updated_at=? WHERE id=?", old.Format(time.RFC3339Nano), loose.ID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -147,7 +149,7 @@ func TestBrowserInteractionAcceptance(t *testing.T) {
 
 	// The board is the browser's grouping surface. Confirm the initial lane and
 	// card order before driving the same position endpoint used by drag/drop.
-	board := browserPage(t, client, server.URL+"/projects/acceptance", key.Secret, http.StatusOK)
+	board := browserPage(t, client, server.URL+"/projects/acceptance", sessionToken, http.StatusOK)
 	if !strings.Contains(board, "Parent lane") || !strings.Contains(board, "Unparented issues") {
 		t.Fatalf("board did not render graph lanes: %s", board)
 	}
@@ -156,16 +158,16 @@ func TestBrowserInteractionAcceptance(t *testing.T) {
 	}
 
 	// A drag reorder persists sibling positions, not a transient DOM order.
-	browserJSON(t, client, http.MethodPost, server.URL+"/api/v1/issues/"+second.ID+"/position", key.Secret, `{"position":0}`, http.StatusOK)
-	browserJSON(t, client, http.MethodPost, server.URL+"/api/v1/issues/"+first.ID+"/position", key.Secret, `{"position":1}`, http.StatusOK)
+	browserJSON(t, client, http.MethodPost, server.URL+"/api/v1/issues/"+second.ID+"/position", sessionToken, `{"position":0}`, http.StatusOK)
+	browserJSON(t, client, http.MethodPost, server.URL+"/api/v1/issues/"+first.ID+"/position", sessionToken, `{"position":1}`, http.StatusOK)
 	var reordered struct {
 		Issues []Issue `json:"issues"`
 	}
-	decodeBrowserJSON(t, client, server.URL+"/api/v1/projects/acceptance/issues?parent="+parent.ID, key.Secret, http.StatusOK, &reordered)
+	decodeBrowserJSON(t, client, server.URL+"/api/v1/projects/acceptance/issues?parent="+parent.ID, sessionToken, http.StatusOK, &reordered)
 	if len(reordered.Issues) != 2 || reordered.Issues[0].ID != second.ID || reordered.Issues[1].ID != first.ID {
 		t.Fatalf("reorder did not persist through issue query: %#v", reordered.Issues)
 	}
-	board = browserPage(t, client, server.URL+"/projects/acceptance", key.Secret, http.StatusOK)
+	board = browserPage(t, client, server.URL+"/projects/acceptance", sessionToken, http.StatusOK)
 	if secondIndex, firstIndex := strings.Index(board, "Second child"), strings.Index(board, "First child"); secondIndex == -1 || firstIndex == -1 || secondIndex > firstIndex {
 		t.Fatalf("board did not reflect persisted reorder: second=%d first=%d", secondIndex, firstIndex)
 	}
@@ -177,24 +179,24 @@ func TestBrowserInteractionAcceptance(t *testing.T) {
 	var filtered struct {
 		Issues []Issue `json:"issues"`
 	}
-	decodeBrowserJSON(t, client, filterURL, key.Secret, http.StatusOK, &filtered)
+	decodeBrowserJSON(t, client, filterURL, sessionToken, http.StatusOK, &filtered)
 	if len(filtered.Issues) != 3 {
 		t.Fatalf("updated filter interaction returned %#v", filtered.Issues)
 	}
 	var aged struct {
 		Issues []Issue `json:"issues"`
 	}
-	decodeBrowserJSON(t, client, server.URL+"/api/v1/projects/acceptance/issues?state=open&age=168h", key.Secret, http.StatusOK, &aged)
+	decodeBrowserJSON(t, client, server.URL+"/api/v1/projects/acceptance/issues?state=open&age=168h", sessionToken, http.StatusOK, &aged)
 	if len(aged.Issues) != 1 || aged.Issues[0].ID != loose.ID {
 		t.Fatalf("age filter interaction returned %#v", aged.Issues)
 	}
 
 	// Drive the issue detail's edit flow through the same authenticated API
 	// calls its forms use, then verify the rendered detail reflects server state.
-	browserJSON(t, client, http.MethodPatch, server.URL+"/api/v1/issues/"+first.ID, key.Secret, `{"title":"Edited child","body":"## Updated","assignee":"operator","labels":["review"],"parent_id":"`+parent.ID+`"}`, http.StatusOK)
-	browserJSON(t, client, http.MethodPost, server.URL+"/api/v1/issues/"+first.ID+"/comments", key.Secret, `{"body":"Browser update"}`, http.StatusCreated)
-	browserJSON(t, client, http.MethodPost, server.URL+"/api/v1/issues/"+first.ID+"/close", key.Secret, "", http.StatusOK)
-	detail := browserPage(t, client, server.URL+"/projects/acceptance/issues/2", key.Secret, http.StatusOK)
+	browserJSON(t, client, http.MethodPatch, server.URL+"/api/v1/issues/"+first.ID, sessionToken, `{"title":"Edited child","body":"## Updated","assignee":"operator","labels":["review"],"parent_id":"`+parent.ID+`"}`, http.StatusOK)
+	browserJSON(t, client, http.MethodPost, server.URL+"/api/v1/issues/"+first.ID+"/comments", sessionToken, `{"body":"Browser update"}`, http.StatusCreated)
+	browserJSON(t, client, http.MethodPost, server.URL+"/api/v1/issues/"+first.ID+"/close", sessionToken, "", http.StatusOK)
+	detail := browserPage(t, client, server.URL+"/projects/acceptance/issues/2", sessionToken, http.StatusOK)
 	for _, want := range []string{"Edited child", "## Updated", "Browser update", "review", "operator", "status-done"} {
 		if !strings.Contains(detail, want) {
 			t.Fatalf("detail interaction missing %q: %s", want, detail)
@@ -202,13 +204,13 @@ func TestBrowserInteractionAcceptance(t *testing.T) {
 	}
 }
 
-func browserPage(t *testing.T, client *http.Client, endpoint, secret string, expectedStatus int) string {
+func browserPage(t *testing.T, client *http.Client, endpoint, token string, expectedStatus int) string {
 	t.Helper()
 	request, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	request.AddCookie(&http.Cookie{Name: "tracker_key", Value: secret})
+	request.AddCookie(&http.Cookie{Name: browserSessionCookie, Value: token})
 	response, err := client.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -225,13 +227,13 @@ func browserPage(t *testing.T, client *http.Client, endpoint, secret string, exp
 	return string(data)
 }
 
-func browserJSON(t *testing.T, client *http.Client, method, endpoint, secret, body string, expectedStatus int) map[string]any {
+func browserJSON(t *testing.T, client *http.Client, method, endpoint, token, body string, expectedStatus int) map[string]any {
 	t.Helper()
 	request, err := http.NewRequest(method, endpoint, strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
-	request.AddCookie(&http.Cookie{Name: "tracker_key", Value: secret})
+	request.AddCookie(&http.Cookie{Name: browserSessionCookie, Value: token})
 	request.Header.Set("Content-Type", "application/json")
 	response, err := client.Do(request)
 	if err != nil {
@@ -249,13 +251,13 @@ func browserJSON(t *testing.T, client *http.Client, method, endpoint, secret, bo
 	return payload
 }
 
-func decodeBrowserJSON(t *testing.T, client *http.Client, endpoint, secret string, expectedStatus int, target any) {
+func decodeBrowserJSON(t *testing.T, client *http.Client, endpoint, token string, expectedStatus int, target any) {
 	t.Helper()
 	request, err := http.NewRequest(http.MethodGet, endpoint, bytes.NewReader(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	request.AddCookie(&http.Cookie{Name: "tracker_key", Value: secret})
+	request.AddCookie(&http.Cookie{Name: browserSessionCookie, Value: token})
 	response, err := client.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -280,6 +282,7 @@ func TestBrowserIssueDetailExposesEditingAndRelationships(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sessionToken := mustBrowserSession(t, store, key.ID)
 	project, err := store.CreateProject(t.Context(), "Detail", "detail")
 	if err != nil {
 		t.Fatal(err)
@@ -297,7 +300,7 @@ func TestBrowserIssueDetailExposesEditingAndRelationships(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request.AddCookie(&http.Cookie{Name: "tracker_key", Value: key.Secret})
+	request.AddCookie(&http.Cookie{Name: browserSessionCookie, Value: sessionToken})
 	response, err := server.Client().Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -318,10 +321,19 @@ func TestBrowserIssueDetailExposesEditingAndRelationships(t *testing.T) {
 		"Blockers",
 		"data-issue-form",
 		"data-toggle-state",
-		"/comments",
+		"/assets/detail.js",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("detail response missing %q: %s", want, body)
 		}
 	}
+}
+
+func mustBrowserSession(t *testing.T, store *Store, keyID string) string {
+	t.Helper()
+	token, _, err := store.CreateBrowserSession(t.Context(), keyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return token
 }

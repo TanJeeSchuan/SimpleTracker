@@ -8,6 +8,12 @@ go run . serve --data-dir .\data --listen 127.0.0.1:8080
 ```
 
 The server runs ordered SQLite migrations before it starts accepting requests.
+SQLite runs in WAL mode with one serialized write connection and a separate
+multi-connection read pool. Foreign-key enforcement and busy timeouts are
+applied when every connection opens. API-key `last_used_at` writes are
+debounced to once per key every five minutes, so ordinary authenticated reads
+do not continuously compete for the writer.
+
 `GET /healthz` (also `/readyz`) checks the database connection and returns
 `status`, `version`, and `schema`; `GET /version` reports the API and schema
 version without authentication. A non-zero response from `/healthz` means the
@@ -35,6 +41,12 @@ rolling deployment, replication, or external database is required. HTTPS and
 reverse proxying remain operator-managed at the edge.
 
 The bootstrap command prints the secret once. Use it as `Authorization: Bearer <key>` or `X-API-Key: <key>`. Actor and session attribution can be supplied with `X-Actor-ID` and `X-Session-ID`.
+
+Browser login exchanges the API key for a 30-day opaque session. The database
+stores only the session digest, and key revocation invalidates its sessions.
+The browser receives an `HttpOnly`, `SameSite=Strict` cookie. Run the server
+with `--base-url https://tracker.example` when HTTPS terminates at a reverse
+proxy so the cookie is also marked `Secure`.
 
 The versioned API is rooted at `/api/v1`: projects support create/list/read, and issues support create/list/read/update, Markdown bodies, comments, close, and reopen. The browser login is at `/login`; issue pages use `/projects/<slug>/issues/<number>`.
 
