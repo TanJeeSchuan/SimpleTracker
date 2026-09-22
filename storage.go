@@ -9,6 +9,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -22,8 +24,11 @@ var ErrAlreadyExists = errors.New("already exists")
 var ErrInvalidTransition = errors.New("invalid transition")
 var ErrUnauthorized = errors.New("unauthorized")
 
+const currentSchemaVersion = 2
+
 type Store struct {
-	db *sql.DB
+	db     *sql.DB
+	dbPath string
 }
 
 func OpenStore(dataDir string) (*Store, error) {
@@ -33,7 +38,8 @@ func OpenStore(dataDir string) (*Store, error) {
 	if err := ensureDir(dataDir); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", filepath.Join(dataDir, "tracker.db"))
+	dbPath := filepath.Join(dataDir, "tracker.db")
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
@@ -49,7 +55,7 @@ func OpenStore(dataDir string) (*Store, error) {
 			return nil, fmt.Errorf("configure sqlite: %w", err)
 		}
 	}
-	store := &Store{db: db}
+	store := &Store{db: db, dbPath: dbPath}
 	if err := store.migrate(); err != nil {
 		db.Close()
 		return nil, err
@@ -65,16 +71,242 @@ func ensureDir(path string) error {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// Backup creates a standalone SQLite backup while the store is serving. The
+// VACUUM INTO operation runs from a consistent read transaction, including
+// any committed changes in the WAL, and produces a database that can be
+// opened without the live database's -wal/-shm sidecars.
+func (s *Store) Backup(ctx context.Context, destination string) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("store is not open")
+	}
+	destination = strings.TrimSpace(destination)
+	if destination == "" {
+		return fmt.Errorf("backup destination is required")
+	}
+	destinationPath, err := filepath.Abs(destination)
+	if err != nil {
+		return fmt.Errorf("resolve backup destination: %w", err)
+	}
+	if sameFilePath(destinationPath, s.dbPath) {
+		return fmt.Errorf("backup destination must differ from the live database")
+	}
+	parent := filepath.Dir(destinationPath)
+	if err := ensureDir(parent); err != nil {
+		return fmt.Errorf("create backup directory: %w", err)
+	}
+	if _, err := os.Stat(destinationPath); err == nil {
+		return fmt.Errorf("backup destination already exists: %s", destinationPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect backup destination: %w", err)
+	}
+
+	temporary, err := os.CreateTemp(parent, ".simpletracker-backup-*.db")
+	if err != nil {
+		return fmt.Errorf("create backup temporary file: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	if err := temporary.Close(); err != nil {
+		_ = os.Remove(temporaryPath)
+		return fmt.Errorf("close backup temporary file: %w", err)
+	}
+	if err := os.Remove(temporaryPath); err != nil {
+		return fmt.Errorf("prepare backup temporary file: %w", err)
+	}
+	defer os.Remove(temporaryPath)
+
+	if _, err := s.db.ExecContext(ctx, "VACUUM INTO ?", temporaryPath); err != nil {
+		return fmt.Errorf("create sqlite backup: %w", err)
+	}
+	if _, err := validateSQLiteBackup(temporaryPath); err != nil {
+		return fmt.Errorf("validate sqlite backup: %w", err)
+	}
+	if err := os.Rename(temporaryPath, destinationPath); err != nil {
+		return fmt.Errorf("publish sqlite backup: %w", err)
+	}
+	return nil
+}
+
+// RestoreStore validates a backup and installs it as dataDir/tracker.db.
+// Callers must stop the server first: this is intentionally an offline
+// operation. The previous database and any WAL sidecars are retained beside
+// the new database as a rollback copy until the operator removes them.
+func RestoreStore(dataDir, backupPath string) error {
+	if strings.TrimSpace(dataDir) == "" {
+		return fmt.Errorf("data directory is required")
+	}
+	backupPath = strings.TrimSpace(backupPath)
+	if backupPath == "" {
+		return fmt.Errorf("restore source is required")
+	}
+	backupPath, err := filepath.Abs(backupPath)
+	if err != nil {
+		return fmt.Errorf("resolve restore source: %w", err)
+	}
+	if _, err := validateSQLiteBackup(backupPath); err != nil {
+		return fmt.Errorf("validate restore source: %w", err)
+	}
+	if err := ensureDir(dataDir); err != nil {
+		return fmt.Errorf("create data directory: %w", err)
+	}
+	livePath, err := filepath.Abs(filepath.Join(dataDir, "tracker.db"))
+	if err != nil {
+		return fmt.Errorf("resolve live database: %w", err)
+	}
+	if sameFilePath(livePath, backupPath) {
+		return fmt.Errorf("restore source must differ from the live database")
+	}
+
+	temporary, err := os.CreateTemp(filepath.Dir(livePath), ".simpletracker-restore-*.db")
+	if err != nil {
+		return fmt.Errorf("create restore temporary file: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	copyErr := func() error {
+		input, err := os.Open(backupPath)
+		if err != nil {
+			return err
+		}
+		defer input.Close()
+		if _, err := io.Copy(temporary, input); err != nil {
+			return err
+		}
+		return temporary.Sync()
+	}()
+	if err := temporary.Close(); err != nil && copyErr == nil {
+		copyErr = err
+	}
+	if copyErr != nil {
+		_ = os.Remove(temporaryPath)
+		return fmt.Errorf("copy restore source: %w", copyErr)
+	}
+	defer os.Remove(temporaryPath)
+	if _, err := validateSQLiteBackup(temporaryPath); err != nil {
+		return fmt.Errorf("validate restore copy: %w", err)
+	}
+
+	rollbackBase := livePath + ".before-restore-" + time.Now().UTC().Format("20060102T150405.000000000Z")
+	type movedFile struct{ from, to string }
+	moved := make([]movedFile, 0, 3)
+	moveAside := func(path, suffix string) error {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		target := rollbackBase + suffix
+		if err := os.Rename(path, target); err != nil {
+			return err
+		}
+		moved = append(moved, movedFile{from: path, to: target})
+		return nil
+	}
+	rollback := func() {
+		for i := len(moved) - 1; i >= 0; i-- {
+			_ = os.Rename(moved[i].to, moved[i].from)
+		}
+	}
+	if err := moveAside(livePath, ""); err != nil {
+		return fmt.Errorf("move live database aside: %w", err)
+	}
+	if err := moveAside(livePath+"-wal", "-wal"); err != nil {
+		rollback()
+		return fmt.Errorf("move live database WAL aside: %w", err)
+	}
+	if err := moveAside(livePath+"-shm", "-shm"); err != nil {
+		rollback()
+		return fmt.Errorf("move live database shared memory aside: %w", err)
+	}
+	if err := os.Rename(temporaryPath, livePath); err != nil {
+		rollback()
+		return fmt.Errorf("install restored database: %w", err)
+	}
+	return nil
+}
+
+func validateSQLiteBackup(path string) (int, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	if !info.Mode().IsRegular() {
+		return 0, fmt.Errorf("backup is not a regular file")
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return 0, err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec("PRAGMA query_only = ON"); err != nil {
+		return 0, err
+	}
+	var integrity string
+	if err := db.QueryRow("PRAGMA integrity_check").Scan(&integrity); err != nil {
+		return 0, err
+	}
+	if !strings.EqualFold(strings.TrimSpace(integrity), "ok") {
+		return 0, fmt.Errorf("integrity check failed: %s", integrity)
+	}
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		return 0, err
+	}
+	if version > currentSchemaVersion {
+		return 0, fmt.Errorf("schema version %d is newer than this binary supports", version)
+	}
+	var tables int
+	if err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('api_keys','projects','issues')").Scan(&tables); err != nil {
+		return 0, err
+	}
+	if tables != 3 {
+		return 0, fmt.Errorf("backup does not contain the SimpleTracker schema")
+	}
+	return version, nil
+}
+
+func sameFilePath(left, right string) bool {
+	if strings.TrimSpace(right) == "" {
+		return false
+	}
+	leftAbs, leftErr := filepath.Abs(left)
+	rightAbs, rightErr := filepath.Abs(right)
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	leftAbs = filepath.Clean(leftAbs)
+	rightAbs = filepath.Clean(rightAbs)
+	if strings.EqualFold(leftAbs, rightAbs) {
+		return true
+	}
+	leftResolved, leftErr := filepath.EvalSymlinks(leftAbs)
+	rightResolved, rightErr := filepath.EvalSymlinks(rightAbs)
+	return leftErr == nil && rightErr == nil && strings.EqualFold(filepath.Clean(leftResolved), filepath.Clean(rightResolved))
+}
+
 func (s *Store) migrate() error {
 	var version int
 	if err := s.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		return fmt.Errorf("read schema version: %w", err)
 	}
-	if version > 2 {
+	if version > currentSchemaVersion {
 		return fmt.Errorf("database schema version %d is newer than this binary supports", version)
 	}
-	if version == 0 {
-		_, err := s.db.Exec(`
+	if version == currentSchemaVersion {
+		return nil
+	}
+
+	// Every migration runs in one transaction. SQLite supports transactional
+	// DDL, so a failed migration cannot leave a database half-upgraded with a
+	// user_version that still claims it is ready to serve.
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin schema migration: %w", err)
+	}
+	defer tx.Rollback()
+
+	switch version {
+	case 0:
+		_, err = tx.Exec(`
 CREATE TABLE IF NOT EXISTS api_keys (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -154,8 +386,7 @@ PRAGMA user_version = 2;
 		if err != nil {
 			return fmt.Errorf("apply schema migration: %w", err)
 		}
-	}
-	if version == 1 {
+	case 1:
 		// Version 1 databases are from the first vertical slice. Keep them
 		// upgradeable in place instead of requiring users to discard issue data.
 		for _, statement := range []string{
@@ -171,10 +402,15 @@ PRAGMA user_version = 2;
 			"CREATE INDEX IF NOT EXISTS issue_blockers_blocker_idx ON issue_blockers(blocker_id, issue_id)",
 			"PRAGMA user_version = 2",
 		} {
-			if _, err := s.db.Exec(statement); err != nil {
+			if _, err := tx.Exec(statement); err != nil {
 				return fmt.Errorf("upgrade schema: %w", err)
 			}
 		}
+	default:
+		return fmt.Errorf("database schema version %d cannot be migrated", version)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit schema migration: %w", err)
 	}
 	return nil
 }

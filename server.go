@@ -30,6 +30,8 @@ func NewServer(store *Store, baseURL, version string) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.health)
+	mux.HandleFunc("/health", s.health)
+	mux.HandleFunc("/readyz", s.health)
 	mux.HandleFunc("/version", s.version)
 	mux.HandleFunc("/login", s.login)
 	mux.HandleFunc("/api/v1/", s.api)
@@ -52,7 +54,15 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+	if s.Store == nil || s.Store.db == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "unavailable"})
+		return
+	}
+	if err := s.Store.db.PingContext(r.Context()); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "unavailable"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": s.versionValue(), "schema": currentSchemaVersion})
 }
 
 func (s *Server) version(w http.ResponseWriter, r *http.Request) {
@@ -60,11 +70,14 @@ func (s *Server) version(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
-	version := s.Version
-	if version == "" {
-		version = "dev"
+	writeJSON(w, http.StatusOK, map[string]any{"version": s.versionValue(), "api": "v1", "schema": currentSchemaVersion})
+}
+
+func (s *Server) versionValue() string {
+	if strings.TrimSpace(s.Version) == "" {
+		return "dev"
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"version": version, "api": "v1"})
+	return s.Version
 }
 
 func (s *Server) api(w http.ResponseWriter, r *http.Request) {

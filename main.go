@@ -28,6 +28,10 @@ func main() {
 	switch os.Args[1] {
 	case "bootstrap":
 		err = commandBootstrap(os.Args[2:])
+	case "backup":
+		err = commandBackup(os.Args[2:])
+	case "restore":
+		err = commandRestore(os.Args[2:])
 	case "serve", "server":
 		err = commandServe(os.Args[2:])
 	case "project":
@@ -53,6 +57,8 @@ func usage() {
 
 Commands:
   bootstrap --data-dir DIR [--name NAME]       create the first API key
+  backup --data-dir DIR --output FILE          create a consistent SQLite backup
+  restore --data-dir DIR --backup FILE         validate and restore a backup offline
   serve --data-dir DIR [--listen ADDR]         run the HTTP server
 	project create|list|get                       project operations
 	issue create|list|get|update|close|reopen    issue operations
@@ -83,6 +89,57 @@ func commandBootstrap(args []string) error {
 		return err
 	}
 	printJSON(key)
+	return nil
+}
+
+func commandBackup(args []string) error {
+	flags := flag.NewFlagSet("backup", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	dataDir := flags.String("data-dir", "./data", "persistent data directory")
+	output := flags.String("output", "", "backup destination file")
+	destination := flags.String("destination", "", "backup destination file (alias for --output)")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	path := strings.TrimSpace(*output)
+	if path == "" {
+		path = strings.TrimSpace(*destination)
+	}
+	if path == "" {
+		return fmt.Errorf("--output is required")
+	}
+	store, err := OpenStore(*dataDir)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := store.Backup(context.Background(), path); err != nil {
+		return err
+	}
+	printJSON(map[string]any{"backup": path, "schema": currentSchemaVersion})
+	return nil
+}
+
+func commandRestore(args []string) error {
+	flags := flag.NewFlagSet("restore", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	dataDir := flags.String("data-dir", "./data", "persistent data directory")
+	backup := flags.String("backup", "", "backup source file")
+	source := flags.String("source", "", "backup source file (alias for --backup)")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	path := strings.TrimSpace(*backup)
+	if path == "" {
+		path = strings.TrimSpace(*source)
+	}
+	if path == "" {
+		return fmt.Errorf("--backup is required")
+	}
+	if err := RestoreStore(*dataDir, path); err != nil {
+		return err
+	}
+	printJSON(map[string]any{"restored": true, "data_dir": *dataDir, "schema": currentSchemaVersion})
 	return nil
 }
 
