@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -54,7 +55,8 @@ Commands:
   bootstrap --data-dir DIR [--name NAME]       create the first API key
   serve --data-dir DIR [--listen ADDR]         run the HTTP server
 	project create|list|get                       project operations
-  issue create|list|get|update|close|reopen    issue operations
+	issue create|list|get|update|close|reopen    issue operations
+  issue comment|label|assign|unassign|parent|block|unblock|order|frontier
   key create|list|revoke                        API key operations
 
 All project/issue/key client commands emit JSON and accept --server and --api-key.`)
@@ -187,6 +189,18 @@ func commandIssue(args []string) error {
 	ref := flags.String("id", "", "issue id or project#number")
 	title := flags.String("title", "", "issue title")
 	body := flags.String("body", "", "Markdown body")
+	parent := flags.String("parent", "", "parent issue id or project#number")
+	label := flags.String("label", "", "issue label")
+	labels := flags.String("labels", "", "comma-separated issue labels")
+	assignee := flags.String("assignee", "", "assignee")
+	state := flags.String("state", "", "open or closed")
+	assigned := flags.String("assigned", "", "assigned or unassigned")
+	search := flags.String("q", "", "text search")
+	age := flags.String("age", "", "maximum age since update (duration or days)")
+	updatedSince := flags.String("updated-since", "", "updated since RFC3339 timestamp")
+	updatedUntil := flags.String("updated-until", "", "updated until RFC3339 timestamp")
+	position := flags.Int64("position", 0, "sibling position")
+	remove := flags.Bool("remove", false, "remove a label")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -195,12 +209,29 @@ func commandIssue(args []string) error {
 		if *project == "" {
 			return fmt.Errorf("--project is required")
 		}
-		return opts.request(http.MethodPost, "/api/v1/projects/"+urlPath(*project)+"/issues", map[string]string{"title": *title, "body": *body})
-	case "list":
-		if *project == "" {
-			return fmt.Errorf("--project is required")
+		payload := map[string]any{"title": *title, "body": *body}
+		if *parent != "" {
+			payload["parent_id"] = *parent
 		}
-		return opts.request(http.MethodGet, "/api/v1/projects/"+urlPath(*project)+"/issues", nil)
+		if *assignee != "" {
+			payload["assignee"] = *assignee
+		}
+		if *labels != "" {
+			payload["labels"] = splitCSV(*labels)
+		}
+		return opts.request(http.MethodPost, "/api/v1/projects/"+urlPath(*project)+"/issues", payload)
+	case "list":
+		path := "/api/v1/issues"
+		if *project != "" {
+			path = "/api/v1/projects/" + urlPath(*project) + "/issues"
+		}
+		return opts.request(http.MethodGet, addIssueQuery(path, *parent, *label, *assignee, *state, *assigned, *search, *age, *updatedSince, *updatedUntil), nil)
+	case "frontier":
+		path := "/api/v1/frontier"
+		if *project != "" {
+			path = "/api/v1/projects/" + urlPath(*project) + "/frontier"
+		}
+		return opts.request(http.MethodGet, addIssueQuery(path, *parent, "", "", "", "unassigned", "", "", "", ""), nil)
 	case "get":
 		if *ref == "" {
 			return fmt.Errorf("--id is required")
@@ -235,9 +266,79 @@ func commandIssue(args []string) error {
 			return fmt.Errorf("--id is required")
 		}
 		return opts.request(http.MethodPost, "/api/v1/issues/"+urlPath(*ref)+"/"+action, nil)
+	case "comment":
+		if *ref == "" || *body == "" {
+			return fmt.Errorf("--id and --body are required")
+		}
+		return opts.request(http.MethodPost, "/api/v1/issues/"+urlPath(*ref)+"/comments", map[string]string{"body": *body})
+	case "label":
+		if *ref == "" || *label == "" {
+			return fmt.Errorf("--id and --label are required")
+		}
+		if *remove {
+			return opts.request(http.MethodDelete, "/api/v1/issues/"+urlPath(*ref)+"/labels/"+urlPath(*label), nil)
+		}
+		return opts.request(http.MethodPost, "/api/v1/issues/"+urlPath(*ref)+"/labels", map[string]string{"label": *label})
+	case "assign":
+		if *ref == "" || *assignee == "" {
+			return fmt.Errorf("--id and --assignee are required")
+		}
+		return opts.request(http.MethodPost, "/api/v1/issues/"+urlPath(*ref)+"/assign", map[string]string{"assignee": *assignee})
+	case "unassign":
+		if *ref == "" {
+			return fmt.Errorf("--id is required")
+		}
+		return opts.request(http.MethodDelete, "/api/v1/issues/"+urlPath(*ref)+"/assign", nil)
+	case "parent":
+		if *ref == "" {
+			return fmt.Errorf("--id is required")
+		}
+		if *parent == "" {
+			return opts.request(http.MethodDelete, "/api/v1/issues/"+urlPath(*ref)+"/parent", nil)
+		}
+		return opts.request(http.MethodPost, "/api/v1/issues/"+urlPath(*ref)+"/parent", map[string]string{"parent_id": *parent})
+	case "block", "unblock":
+		if *ref == "" || *parent == "" {
+			return fmt.Errorf("--id and --parent (blocker issue) are required")
+		}
+		method := http.MethodPost
+		if action == "unblock" {
+			method = http.MethodDelete
+		}
+		path := "/api/v1/issues/" + urlPath(*ref) + "/blockers/" + urlPath(*parent)
+		return opts.request(method, path, nil)
+	case "order":
+		if *ref == "" {
+			return fmt.Errorf("--id is required")
+		}
+		return opts.request(http.MethodPost, "/api/v1/issues/"+urlPath(*ref)+"/position", map[string]int64{"position": *position})
 	default:
 		return fmt.Errorf("unknown issue action %q", action)
 	}
+}
+
+func splitCSV(value string) []string {
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
+}
+
+func addIssueQuery(path, parent, label, assignee, state, assigned, search, age, updatedSince, updatedUntil string) string {
+	query := url.Values{}
+	for key, value := range map[string]string{"parent": parent, "label": label, "assignee": assignee, "state": state, "assigned": assigned, "q": search, "age": age, "updated_since": updatedSince, "updated_until": updatedUntil} {
+		if value != "" {
+			query.Set(key, value)
+		}
+	}
+	if encoded := query.Encode(); encoded != "" {
+		return path + "?" + encoded
+	}
+	return path
 }
 
 func commandKey(args []string) error {

@@ -95,6 +95,14 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		s.projects(w, r)
 		return
 	}
+	if path == "/issues" {
+		s.queryIssues(w, r, "")
+		return
+	}
+	if path == "/frontier" {
+		s.frontier(w, r, "")
+		return
+	}
 	if strings.HasPrefix(path, "/projects/") {
 		s.projectRoutes(w, r, strings.TrimPrefix(path, "/projects/"))
 		return
@@ -264,34 +272,33 @@ func (s *Server) projectRoutes(w http.ResponseWriter, r *http.Request, ref strin
 		writeJSON(w, http.StatusOK, project)
 		return
 	}
+	if len(parts) == 2 && parts[1] == "frontier" {
+		s.frontier(w, r, project.Slug)
+		return
+	}
 	if parts[1] != "issues" {
 		writeError(w, http.StatusNotFound, "not_found", "project route not found")
 		return
 	}
 	if len(parts) == 2 {
 		if r.Method == http.MethodGet {
-			issues, err := s.Store.ListIssues(r.Context(), project.ID)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
-				return
-			}
-			for i := range issues {
-				s.decorateIssue(r, &issues[i])
-			}
-			writeJSON(w, http.StatusOK, map[string]any{"issues": issues})
+			s.queryIssues(w, r, project.Slug)
 			return
 		}
 		if r.Method == http.MethodPost {
 			var input struct {
-				Title string `json:"title"`
-				Body  string `json:"body"`
+				Title    string   `json:"title"`
+				Body     string   `json:"body"`
+				ParentID string   `json:"parent_id"`
+				Labels   []string `json:"labels"`
+				Assignee string   `json:"assignee"`
 			}
 			if err := decodeJSON(r.Body, &input); err != nil {
 				writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
 				return
 			}
 			auth := authFromRequest(r)
-			issue, err := s.Store.CreateIssue(r.Context(), project.ID, input.Title, input.Body, auth.Key.ID, auth.Actor, auth.Session)
+			issue, err := s.Store.CreateIssueWithOptions(r.Context(), project.ID, input.Title, input.Body, auth.Key.ID, auth.Actor, auth.Session, IssueCreateOptions{ParentID: input.ParentID, Labels: input.Labels, Assignee: input.Assignee})
 			if errors.Is(err, ErrNotFound) {
 				writeError(w, http.StatusNotFound, "not_found", "project not found")
 				return
@@ -359,6 +366,10 @@ func (s *Server) issueRoutes(w http.ResponseWriter, r *http.Request, ref string)
 		s.decorateIssue(r, &updated)
 		writeJSON(w, http.StatusOK, updated)
 	case "comments":
+		if r.Method == http.MethodGet {
+			writeJSON(w, http.StatusOK, map[string]any{"comments": issue.Comments})
+			return
+		}
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 			return
@@ -376,6 +387,95 @@ func (s *Server) issueRoutes(w http.ResponseWriter, r *http.Request, ref string)
 			return
 		}
 		writeJSON(w, http.StatusCreated, comment)
+	case "labels":
+		s.issueLabels(w, r, issue, parts[2:], auth)
+	case "assign":
+		if r.Method == http.MethodDelete {
+			updated, err := s.Store.AssignIssue(r.Context(), issue.ID, "", auth.Key.ID, auth.Actor, auth.Session)
+			if err != nil {
+				s.writeStoreError(w, err)
+				return
+			}
+			s.decorateIssue(r, &updated)
+			writeJSON(w, http.StatusOK, updated)
+			return
+		}
+		if r.Method != http.MethodPost && r.Method != http.MethodPut {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+			return
+		}
+		var input struct {
+			Assignee string `json:"assignee"`
+			Assigned string `json:"assigned_to"`
+		}
+		if err := decodeJSON(r.Body, &input); err != nil {
+			s.writeStoreError(w, err)
+			return
+		}
+		if strings.TrimSpace(input.Assignee) == "" {
+			input.Assignee = input.Assigned
+		}
+		updated, err := s.Store.AssignIssue(r.Context(), issue.ID, input.Assignee, auth.Key.ID, auth.Actor, auth.Session)
+		if err != nil {
+			s.writeStoreError(w, err)
+			return
+		}
+		s.decorateIssue(r, &updated)
+		writeJSON(w, http.StatusOK, updated)
+	case "parent":
+		if r.Method == http.MethodDelete {
+			updated, err := s.Store.SetParent(r.Context(), issue.ID, "", auth.Key.ID, auth.Actor, auth.Session)
+			if err != nil {
+				s.writeStoreError(w, err)
+				return
+			}
+			s.decorateIssue(r, &updated)
+			writeJSON(w, http.StatusOK, updated)
+			return
+		}
+		if r.Method != http.MethodPost && r.Method != http.MethodPut {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+			return
+		}
+		var input struct {
+			ParentID string `json:"parent_id"`
+			Parent   string `json:"parent"`
+		}
+		if err := decodeJSON(r.Body, &input); err != nil {
+			s.writeStoreError(w, err)
+			return
+		}
+		if strings.TrimSpace(input.ParentID) == "" {
+			input.ParentID = input.Parent
+		}
+		updated, err := s.Store.SetParent(r.Context(), issue.ID, input.ParentID, auth.Key.ID, auth.Actor, auth.Session)
+		if err != nil {
+			s.writeStoreError(w, err)
+			return
+		}
+		s.decorateIssue(r, &updated)
+		writeJSON(w, http.StatusOK, updated)
+	case "blockers":
+		s.issueBlockers(w, r, issue, parts[2:], auth)
+	case "position", "order", "reorder":
+		if r.Method != http.MethodPost && r.Method != http.MethodPatch {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+			return
+		}
+		var input struct {
+			Position int64 `json:"position"`
+		}
+		if err := decodeJSON(r.Body, &input); err != nil {
+			s.writeStoreError(w, err)
+			return
+		}
+		updated, err := s.Store.SetIssuePosition(r.Context(), issue.ID, input.Position, auth.Key.ID, auth.Actor, auth.Session)
+		if err != nil {
+			s.writeStoreError(w, err)
+			return
+		}
+		s.decorateIssue(r, &updated)
+		writeJSON(w, http.StatusOK, updated)
 	case "audit":
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
@@ -400,8 +500,11 @@ func (s *Server) issueWithMethod(w http.ResponseWriter, r *http.Request, issue I
 		writeJSON(w, http.StatusOK, issue)
 	case http.MethodPatch, http.MethodPut:
 		var input struct {
-			Title *string `json:"title"`
-			Body  *string `json:"body"`
+			Title    *string   `json:"title"`
+			Body     *string   `json:"body"`
+			ParentID *string   `json:"parent_id"`
+			Assignee *string   `json:"assignee"`
+			Labels   *[]string `json:"labels"`
 		}
 		if err := decodeJSON(r.Body, &input); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
@@ -412,6 +515,57 @@ func (s *Server) issueWithMethod(w http.ResponseWriter, r *http.Request, issue I
 			s.writeStoreError(w, err)
 			return
 		}
+		if input.ParentID != nil {
+			updated, err = s.Store.SetParent(r.Context(), updated.ID, *input.ParentID, auth.Key.ID, auth.Actor, auth.Session)
+			if err != nil {
+				s.writeStoreError(w, err)
+				return
+			}
+		}
+		if input.Assignee != nil {
+			updated, err = s.Store.AssignIssue(r.Context(), updated.ID, *input.Assignee, auth.Key.ID, auth.Actor, auth.Session)
+			if err != nil {
+				s.writeStoreError(w, err)
+				return
+			}
+		}
+		if input.Labels != nil {
+			desired := normalizeLabels(*input.Labels)
+			keep := make(map[string]struct{}, len(desired))
+			for _, label := range desired {
+				keep[label] = struct{}{}
+			}
+			for _, label := range updated.Labels {
+				if _, ok := keep[label]; !ok {
+					if _, err := s.Store.RemoveLabel(r.Context(), updated.ID, label, auth.Key.ID, auth.Actor, auth.Session); err != nil {
+						s.writeStoreError(w, err)
+						return
+					}
+				}
+			}
+			updated, err = s.Store.GetIssue(r.Context(), updated.ID)
+			if err != nil {
+				s.writeStoreError(w, err)
+				return
+			}
+			have := make(map[string]struct{}, len(updated.Labels))
+			for _, label := range updated.Labels {
+				have[label] = struct{}{}
+			}
+			for _, label := range desired {
+				if _, ok := have[label]; !ok {
+					if _, err := s.Store.AddLabel(r.Context(), updated.ID, label, auth.Key.ID, auth.Actor, auth.Session); err != nil {
+						s.writeStoreError(w, err)
+						return
+					}
+				}
+			}
+			updated, err = s.Store.GetIssue(r.Context(), updated.ID)
+			if err != nil {
+				s.writeStoreError(w, err)
+				return
+			}
+		}
 		s.decorateIssue(r, &updated)
 		writeJSON(w, http.StatusOK, updated)
 	default:
@@ -419,11 +573,234 @@ func (s *Server) issueWithMethod(w http.ResponseWriter, r *http.Request, issue I
 	}
 }
 
+func (s *Server) queryIssues(w http.ResponseWriter, r *http.Request, project string) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	filters, err := parseIssueFilters(r, project)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	issues, err := s.Store.QueryIssues(r.Context(), filters)
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	for i := range issues {
+		s.decorateIssue(r, &issues[i])
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"issues": issues})
+}
+
+func (s *Server) frontier(w http.ResponseWriter, r *http.Request, project string) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	filters, err := parseIssueFilters(r, project)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	issues, err := s.Store.Frontier(r.Context(), filters)
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	for i := range issues {
+		s.decorateIssue(r, &issues[i])
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"frontier": issues, "issues": issues})
+}
+
+func parseIssueFilters(r *http.Request, project string) (IssueFilters, error) {
+	query := r.URL.Query()
+	if strings.TrimSpace(project) == "" {
+		project = strings.TrimSpace(query.Get("project"))
+	}
+	filters := IssueFilters{ProjectID: project, State: strings.TrimSpace(query.Get("state"))}
+	if filters.State == "" {
+		filters.State = strings.TrimSpace(query.Get("status"))
+	}
+	filters.Parent = strings.TrimSpace(query.Get("parent"))
+	filters.Label = strings.TrimSpace(query.Get("label"))
+	filters.Assigned = strings.TrimSpace(query.Get("assigned"))
+	if filters.Assigned == "" {
+		filters.Assigned = strings.TrimSpace(query.Get("assignment"))
+	}
+	filters.Assignee = strings.TrimSpace(query.Get("assignee"))
+	filters.Text = strings.TrimSpace(query.Get("q"))
+	if filters.Text == "" {
+		filters.Text = strings.TrimSpace(query.Get("search"))
+	}
+	parseTime := func(name string) (*time.Time, error) {
+		value := strings.TrimSpace(query.Get(name))
+		if value == "" {
+			return nil, nil
+		}
+		parsed, err := time.Parse(time.RFC3339, value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid %s: %w", name, err)
+		}
+		return &parsed, nil
+	}
+	var err error
+	filters.UpdatedSince, err = parseTime("updated_since")
+	if err != nil {
+		return IssueFilters{}, err
+	}
+	if filters.UpdatedSince == nil {
+		filters.UpdatedSince, err = parseTime("updated_after")
+		if err != nil {
+			return IssueFilters{}, err
+		}
+	}
+	filters.UpdatedUntil, err = parseTime("updated_until")
+	if err != nil {
+		return IssueFilters{}, err
+	}
+	if filters.UpdatedUntil == nil {
+		filters.UpdatedUntil, err = parseTime("updated_before")
+		if err != nil {
+			return IssueFilters{}, err
+		}
+	}
+	if age := strings.TrimSpace(query.Get("age")); age != "" {
+		filters.Age, err = time.ParseDuration(age)
+		if err != nil {
+			if days, parseErr := strconv.Atoi(age); parseErr == nil && days >= 0 {
+				filters.Age = time.Duration(days) * 24 * time.Hour
+			} else {
+				return IssueFilters{}, fmt.Errorf("invalid age: %w", err)
+			}
+		}
+	}
+	return filters, nil
+}
+
+func (s *Server) issueLabels(w http.ResponseWriter, r *http.Request, issue Issue, suffix []string, auth AuthContext) {
+	if len(suffix) > 1 {
+		writeError(w, http.StatusNotFound, "not_found", "label route not found")
+		return
+	}
+	if r.Method == http.MethodGet && len(suffix) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"labels": issue.Labels})
+		return
+	}
+	label := ""
+	if len(suffix) == 1 {
+		label = suffix[0]
+	}
+	if r.Method == http.MethodPost {
+		var input struct {
+			Label  string   `json:"label"`
+			Labels []string `json:"labels"`
+		}
+		if err := decodeJSON(r.Body, &input); err != nil {
+			s.writeStoreError(w, err)
+			return
+		}
+		if label == "" {
+			label = input.Label
+		}
+		if label != "" {
+			input.Labels = append(input.Labels, label)
+		}
+		for _, value := range input.Labels {
+			if _, err := s.Store.AddLabel(r.Context(), issue.ID, value, auth.Key.ID, auth.Actor, auth.Session); err != nil {
+				s.writeStoreError(w, err)
+				return
+			}
+		}
+		updated, err := s.Store.GetIssue(r.Context(), issue.ID)
+		if err != nil {
+			s.writeStoreError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"labels": updated.Labels})
+		return
+	}
+	if r.Method == http.MethodDelete && label == "" {
+		var input struct {
+			Label string `json:"label"`
+		}
+		if err := decodeJSON(r.Body, &input); err != nil {
+			s.writeStoreError(w, err)
+			return
+		}
+		label = input.Label
+	}
+	if r.Method == http.MethodDelete && label != "" {
+		labels, err := s.Store.RemoveLabel(r.Context(), issue.ID, label, auth.Key.ID, auth.Actor, auth.Session)
+		if err != nil {
+			s.writeStoreError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"labels": labels})
+		return
+	}
+	writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+}
+
+func (s *Server) issueBlockers(w http.ResponseWriter, r *http.Request, issue Issue, suffix []string, auth AuthContext) {
+	if len(suffix) > 1 {
+		writeError(w, http.StatusNotFound, "not_found", "blocker route not found")
+		return
+	}
+	if r.Method == http.MethodGet && len(suffix) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"blockers": issue.Blockers, "blocked": issue.Blocked})
+		return
+	}
+	var input struct {
+		BlockerID string `json:"blocker_id"`
+		ID        string `json:"id"`
+	}
+	if r.Method == http.MethodPost {
+		if err := decodeJSON(r.Body, &input); err != nil {
+			s.writeStoreError(w, err)
+			return
+		}
+		if strings.TrimSpace(input.BlockerID) == "" {
+			input.BlockerID = input.ID
+		}
+		updated, err := s.Store.AddBlocker(r.Context(), issue.ID, input.BlockerID, auth.Key.ID, auth.Actor, auth.Session)
+		if err != nil {
+			s.writeStoreError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, updated)
+		return
+	}
+	if r.Method == http.MethodDelete {
+		if len(suffix) == 1 {
+			input.BlockerID = suffix[0]
+		} else if err := decodeJSON(r.Body, &input); err != nil && !errors.Is(err, io.EOF) {
+			s.writeStoreError(w, err)
+			return
+		}
+		if strings.TrimSpace(input.BlockerID) == "" {
+			input.BlockerID = input.ID
+		}
+		updated, err := s.Store.RemoveBlocker(r.Context(), issue.ID, input.BlockerID, auth.Key.ID, auth.Actor, auth.Session)
+		if err != nil {
+			s.writeStoreError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, updated)
+		return
+	}
+	writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+}
+
 func (s *Server) writeStoreError(w http.ResponseWriter, err error) {
 	status, code := http.StatusBadRequest, "invalid_request"
 	switch {
 	case errors.Is(err, ErrNotFound):
 		status, code = http.StatusNotFound, "not_found"
+	case errors.Is(err, ErrAlreadyExists):
+		status, code = http.StatusConflict, "already_exists"
 	case errors.Is(err, ErrInvalidTransition):
 		status, code = http.StatusConflict, "invalid_transition"
 	}
@@ -580,6 +957,39 @@ func renderProjectIndex(projects []Project) string {
 func renderIssuePage(issue Issue) string {
 	var b strings.Builder
 	b.WriteString(`<!doctype html><meta charset="utf-8"><title>` + template.HTMLEscapeString(issue.Title) + ` · SimpleTracker</title><style>body{font:16px system-ui;max-width:56rem;margin:3rem auto;padding:1rem;color:#20242a}article{border:1px solid #ddd;border-radius:.6rem;padding:1.5rem}pre{white-space:pre-wrap;background:#f6f7f9;padding:1rem;border-radius:.4rem}.meta{color:#64707d;font-size:.9rem}</style><p><a href="/">Projects</a> / ` + template.HTMLEscapeString(issue.ProjectSlug) + `</p><article><h1>#` + strconv.FormatInt(issue.Number, 10) + ` ` + template.HTMLEscapeString(issue.Title) + `</h1><p class="meta">` + template.HTMLEscapeString(issue.State) + ` · updated ` + template.HTMLEscapeString(issue.UpdatedAt.Format(time.RFC3339)) + `</p><pre>` + template.HTMLEscapeString(issue.Body) + `</pre>`)
+	meta := []string{issue.State}
+	if issue.Blocked {
+		meta = append(meta, "blocked")
+	} else {
+		meta = append(meta, "unblocked")
+	}
+	if issue.Assignee != "" {
+		meta = append(meta, "assigned to "+issue.Assignee)
+	} else {
+		meta = append(meta, "unassigned")
+	}
+	meta = append(meta, "updated "+issue.UpdatedAt.Format(time.RFC3339))
+	b.WriteString(`<p class="meta">` + template.HTMLEscapeString(strings.Join(meta, " - ")) + `</p>`)
+	if issue.ParentID != "" {
+		b.WriteString(`<p class="meta">Parent: <code>` + template.HTMLEscapeString(issue.ParentID) + `</code></p>`)
+	}
+	if len(issue.Labels) > 0 {
+		b.WriteString(`<p class="meta">Labels: ` + template.HTMLEscapeString(strings.Join(issue.Labels, ", ")) + `</p>`)
+	}
+	if len(issue.Blockers) > 0 {
+		b.WriteString(`<h2>Blockers</h2><ul>`)
+		for _, blocker := range issue.Blockers {
+			b.WriteString(`<li>#` + strconv.FormatInt(blocker.Number, 10) + ` ` + template.HTMLEscapeString(blocker.Title) + ` (` + template.HTMLEscapeString(blocker.State) + `)</li>`)
+		}
+		b.WriteString(`</ul>`)
+	}
+	if len(issue.Children) > 0 {
+		b.WriteString(`<h2>Children</h2><ul>`)
+		for _, child := range issue.Children {
+			b.WriteString(`<li>#` + strconv.FormatInt(child.Number, 10) + ` ` + template.HTMLEscapeString(child.Title) + ` (` + template.HTMLEscapeString(child.State) + `)</li>`)
+		}
+		b.WriteString(`</ul>`)
+	}
 	if len(issue.Comments) > 0 {
 		b.WriteString("<h2>Comments</h2>")
 		for _, comment := range issue.Comments {
