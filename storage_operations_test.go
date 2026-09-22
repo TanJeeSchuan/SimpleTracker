@@ -181,6 +181,82 @@ func writeForgedV2Backup(t *testing.T, path, missing string) {
 	}
 }
 
+func writeValidV1Database(t *testing.T, path string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statements := []string{
+		`CREATE TABLE api_keys (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  secret_hash TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  last_used_at TEXT,
+  revoked_at TEXT
+)`,
+		`CREATE TABLE projects (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  slug TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL
+)`,
+		`CREATE TABLE issues (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  number INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL CHECK (state IN ('open', 'closed')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  closed_at TEXT,
+  creator_key_id TEXT NOT NULL,
+  creator_actor TEXT NOT NULL DEFAULT '',
+  creator_session TEXT NOT NULL DEFAULT '',
+  position INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(project_id, number)
+)`,
+		`CREATE TABLE comments (
+  id TEXT PRIMARY KEY,
+  issue_id TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  key_id TEXT NOT NULL,
+  actor TEXT NOT NULL DEFAULT '',
+  session TEXT NOT NULL DEFAULT ''
+)`,
+		`CREATE TABLE audit_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  key_id TEXT NOT NULL,
+  actor TEXT NOT NULL DEFAULT '',
+  session TEXT NOT NULL DEFAULT '',
+  operation TEXT NOT NULL,
+  target_type TEXT NOT NULL,
+  target_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  details TEXT NOT NULL DEFAULT ''
+)`,
+		`CREATE INDEX issues_project_state_idx ON issues(project_id, state, position)`,
+		`CREATE INDEX comments_issue_idx ON comments(issue_id, created_at)`,
+		`CREATE INDEX audit_target_idx ON audit_log(target_type, target_id, created_at)`,
+		`INSERT INTO api_keys(id, name, secret_hash, created_at) VALUES ('key-v1', 'v1', '` + secretHash("v1-secret") + `', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO projects(id, name, slug, created_at) VALUES ('project-v1', 'V1 project', 'v1-project', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO issues(id, project_id, number, title, body, state, created_at, updated_at, creator_key_id, creator_actor, creator_session, position) VALUES ('issue-v1', 'project-v1', 1, 'V1 issue', 'preserve me', 'open', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'key-v1', '', '', 0)`,
+		`PRAGMA user_version = 1`,
+	}
+	for _, statement := range statements {
+		if _, err := db.Exec(statement); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func assertRestoreFixtureIntact(t *testing.T, fixture restoreFixture) {
 	t.Helper()
 	store, err := OpenStore(fixture.dataDir)
@@ -248,4 +324,85 @@ func TestOpenStoreRejectsForgedV2Constraints(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestV1MigrationReplacesHistoricalIndexAndSurvivesRestartRestore(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	if err := ensureDir(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	writeValidV1Database(t, filepath.Join(dataDir, "tracker.db"))
+
+	store, err := OpenStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertV1State := func(store *Store) {
+		t.Helper()
+		if _, err := store.Authenticate(t.Context(), "v1-secret"); err != nil {
+			t.Fatalf("v1 auth state was not preserved: %v", err)
+		}
+		project, err := store.GetProject(t.Context(), "project-v1")
+		if err != nil || project.Slug != "v1-project" {
+			t.Fatalf("v1 project state was not preserved: project=%#v err=%v", project, err)
+		}
+		issue, err := store.GetIssue(t.Context(), "issue-v1")
+		if err != nil || issue.Title != "V1 issue" || issue.Body != "preserve me" {
+			t.Fatalf("v1 issue state was not preserved: issue=%#v err=%v", issue, err)
+		}
+	}
+	assertV1State(store)
+
+	rows, err := store.db.Query("PRAGMA index_info(issues_project_state_idx)")
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	var indexColumns []string
+	for rows.Next() {
+		var seq, cid int
+		var name string
+		if err := rows.Scan(&seq, &cid, &name); err != nil {
+			rows.Close()
+			store.Close()
+			t.Fatal(err)
+		}
+		indexColumns = append(indexColumns, name)
+	}
+	if err := rows.Close(); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if !equalStringSlices(indexColumns, []string{"project_id", "state", "parent_id", "position"}) {
+		store.Close()
+		t.Fatalf("migration kept historical index shape: %v", indexColumns)
+	}
+
+	backupPath := filepath.Join(t.TempDir(), "v1-migrated.db")
+	if err := store.Backup(t.Context(), backupPath); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := OpenStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertV1State(restarted)
+	if err := restarted.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RestoreStore(dataDir, backupPath); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := OpenStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	assertV1State(restored)
 }

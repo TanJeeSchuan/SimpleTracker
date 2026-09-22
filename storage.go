@@ -873,6 +873,8 @@ PRAGMA user_version = 2;
 			"ALTER TABLE issues ADD COLUMN assigned_at TEXT",
 			`CREATE TABLE IF NOT EXISTS issue_labels (issue_id TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE, label TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(issue_id, label))`,
 			`CREATE TABLE IF NOT EXISTS issue_blockers (issue_id TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE, blocker_id TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE, created_at TEXT NOT NULL, PRIMARY KEY(issue_id, blocker_id), CHECK(issue_id <> blocker_id))`,
+			"DROP INDEX IF EXISTS issues_project_state_idx",
+			"CREATE INDEX issues_project_state_idx ON issues(project_id, state, parent_id, position)",
 			"CREATE INDEX IF NOT EXISTS issues_parent_idx ON issues(parent_id, position)",
 			"CREATE INDEX IF NOT EXISTS issue_labels_label_idx ON issue_labels(label, issue_id)",
 			"CREATE INDEX IF NOT EXISTS issue_blockers_blocker_idx ON issue_blockers(blocker_id, issue_id)",
