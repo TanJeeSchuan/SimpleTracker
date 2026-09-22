@@ -279,6 +279,9 @@ func validateSQLiteBackup(path string) (int, error) {
 			}
 		}
 	}
+	if err := validateSchemaContract(db, version); err != nil {
+		return 0, fmt.Errorf("validate schema contract: %w", err)
+	}
 	rows, err := db.Query("PRAGMA foreign_key_check")
 	if err != nil {
 		return 0, fmt.Errorf("check backup foreign keys: %w", err)
@@ -324,6 +327,374 @@ func requiredSchemaColumns(version int) (map[string][]string, bool) {
 	}
 }
 
+type sqliteForeignKeyContract struct {
+	from     string
+	to       string
+	table    string
+	onDelete string
+}
+
+type sqliteIndexContract struct {
+	table   string
+	name    string
+	columns []string
+}
+
+type sqliteSchemaContract struct {
+	notNull  map[string][]string
+	defaults map[string]map[string]string
+	primary  map[string][]string
+	unique   map[string][][]string
+	foreign  map[string][]sqliteForeignKeyContract
+	checks   map[string][]string
+	indexes  []sqliteIndexContract
+}
+
+var schemaContractV1 = sqliteSchemaContract{
+	notNull: map[string][]string{
+		"api_keys":  {"name", "secret_hash", "created_at"},
+		"projects":  {"name", "slug", "created_at"},
+		"issues":    {"project_id", "number", "title", "body", "state", "created_at", "updated_at", "creator_key_id", "creator_actor", "creator_session", "position"},
+		"comments":  {"issue_id", "body", "created_at", "key_id", "actor", "session"},
+		"audit_log": {"key_id", "actor", "session", "operation", "target_type", "target_id", "created_at", "details"},
+	},
+	defaults: map[string]map[string]string{
+		"issues":    {"body": "''", "creator_actor": "''", "creator_session": "''", "position": "0"},
+		"comments":  {"actor": "''", "session": "''"},
+		"audit_log": {"actor": "''", "session": "''", "details": "''"},
+	},
+	primary: map[string][]string{
+		"api_keys":  {"id"},
+		"projects":  {"id"},
+		"issues":    {"id"},
+		"comments":  {"id"},
+		"audit_log": {"id"},
+	},
+	unique: map[string][][]string{
+		"api_keys": {{"secret_hash"}},
+		"projects": {{"slug"}},
+		"issues":   {{"project_id", "number"}},
+	},
+	foreign: map[string][]sqliteForeignKeyContract{
+		"issues":   {{from: "project_id", to: "id", table: "projects", onDelete: "cascade"}},
+		"comments": {{from: "issue_id", to: "id", table: "issues", onDelete: "cascade"}},
+	},
+	checks: map[string][]string{
+		"issues": {"check(statein('open','closed'))"},
+	},
+	indexes: []sqliteIndexContract{
+		{table: "issues", name: "issues_project_state_idx", columns: []string{"project_id", "state", "position"}},
+		{table: "comments", name: "comments_issue_idx", columns: []string{"issue_id", "created_at"}},
+		{table: "audit_log", name: "audit_target_idx", columns: []string{"target_type", "target_id", "created_at"}},
+	},
+}
+
+var schemaContractV2 = sqliteSchemaContract{
+	notNull: map[string][]string{
+		"api_keys":       {"name", "secret_hash", "created_at"},
+		"projects":       {"name", "slug", "created_at"},
+		"issues":         {"project_id", "number", "title", "body", "state", "created_at", "updated_at", "creator_key_id", "creator_actor", "creator_session", "position", "assignee", "assigned_key_id", "assigned_actor"},
+		"comments":       {"issue_id", "body", "created_at", "key_id", "actor", "session"},
+		"audit_log":      {"key_id", "actor", "session", "operation", "target_type", "target_id", "created_at", "details"},
+		"issue_labels":   {"issue_id", "label", "created_at"},
+		"issue_blockers": {"issue_id", "blocker_id", "created_at"},
+	},
+	defaults: map[string]map[string]string{
+		"issues":    {"body": "''", "creator_actor": "''", "creator_session": "''", "position": "0", "assignee": "''", "assigned_key_id": "''", "assigned_actor": "''"},
+		"comments":  {"actor": "''", "session": "''"},
+		"audit_log": {"actor": "''", "session": "''", "details": "''"},
+	},
+	primary: map[string][]string{
+		"api_keys":       {"id"},
+		"projects":       {"id"},
+		"issues":         {"id"},
+		"comments":       {"id"},
+		"audit_log":      {"id"},
+		"issue_labels":   {"issue_id", "label"},
+		"issue_blockers": {"issue_id", "blocker_id"},
+	},
+	unique: map[string][][]string{
+		"api_keys": {{"secret_hash"}},
+		"projects": {{"slug"}},
+		"issues":   {{"project_id", "number"}},
+	},
+	foreign: map[string][]sqliteForeignKeyContract{
+		"issues": {
+			{from: "project_id", to: "id", table: "projects", onDelete: "cascade"},
+			{from: "parent_id", to: "id", table: "issues", onDelete: "set null"},
+		},
+		"comments":     {{from: "issue_id", to: "id", table: "issues", onDelete: "cascade"}},
+		"issue_labels": {{from: "issue_id", to: "id", table: "issues", onDelete: "cascade"}},
+		"issue_blockers": {
+			{from: "issue_id", to: "id", table: "issues", onDelete: "cascade"},
+			{from: "blocker_id", to: "id", table: "issues", onDelete: "cascade"},
+		},
+	},
+	checks: map[string][]string{
+		"issues":         {"check(statein('open','closed'))"},
+		"issue_blockers": {"check(issue_id<>blocker_id)"},
+	},
+	indexes: []sqliteIndexContract{
+		{table: "issues", name: "issues_project_state_idx", columns: []string{"project_id", "state", "parent_id", "position"}},
+		{table: "issues", name: "issues_parent_idx", columns: []string{"parent_id", "position"}},
+		{table: "comments", name: "comments_issue_idx", columns: []string{"issue_id", "created_at"}},
+		{table: "audit_log", name: "audit_target_idx", columns: []string{"target_type", "target_id", "created_at"}},
+		{table: "issue_labels", name: "issue_labels_label_idx", columns: []string{"label", "issue_id"}},
+		{table: "issue_blockers", name: "issue_blockers_blocker_idx", columns: []string{"blocker_id", "issue_id"}},
+	},
+}
+
+func schemaContract(version int) (sqliteSchemaContract, bool) {
+	switch version {
+	case 1:
+		return schemaContractV1, true
+	case currentSchemaVersion:
+		return schemaContractV2, true
+	default:
+		return sqliteSchemaContract{}, false
+	}
+}
+
+func validateSchemaContract(db *sql.DB, version int) error {
+	contract, ok := schemaContract(version)
+	if !ok {
+		return fmt.Errorf("unsupported schema version %d", version)
+	}
+	for _, table := range sortedSchemaTableNames(contract.notNull) {
+		columns, err := sqliteTableColumns(db, table)
+		if err != nil {
+			return fmt.Errorf("inspect table %q: %w", table, err)
+		}
+		for _, column := range contract.notNull[table] {
+			info, ok := columns[column]
+			if !ok {
+				return fmt.Errorf("table %q is missing required column %q", table, column)
+			}
+			if !info.notNull {
+				return fmt.Errorf("table %q column %q must be NOT NULL", table, column)
+			}
+		}
+		for column, expectedDefault := range contract.defaults[table] {
+			info, ok := columns[column]
+			if !ok {
+				return fmt.Errorf("table %q is missing defaulted column %q", table, column)
+			}
+			if !info.defaultValue.Valid || strings.TrimSpace(info.defaultValue.String) != expectedDefault {
+				return fmt.Errorf("table %q column %q has unexpected default", table, column)
+			}
+		}
+		if err := validatePrimaryKey(columns, table, contract.primary[table]); err != nil {
+			return err
+		}
+		if err := validateUniqueConstraints(db, table, contract.unique[table]); err != nil {
+			return err
+		}
+		if err := validateForeignKeys(db, table, contract.foreign[table]); err != nil {
+			return err
+		}
+		if err := validateChecks(db, table, contract.checks[table]); err != nil {
+			return err
+		}
+	}
+	for _, index := range contract.indexes {
+		if err := validateIndex(db, index); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validatePrimaryKey(columns map[string]sqliteColumnInfo, table string, expected []string) error {
+	for position, column := range expected {
+		info, ok := columns[column]
+		if !ok || info.primaryKey != position+1 {
+			return fmt.Errorf("table %q is missing required primary key", table)
+		}
+	}
+	for column, info := range columns {
+		if info.primaryKey == 0 {
+			continue
+		}
+		found := false
+		for _, expectedColumn := range expected {
+			if expectedColumn == column {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("table %q has an unexpected primary-key column %q", table, column)
+		}
+	}
+	return nil
+}
+
+func validateUniqueConstraints(db *sql.DB, table string, expected [][]string) error {
+	indexes, err := sqliteIndexes(db, table)
+	if err != nil {
+		return fmt.Errorf("inspect unique constraints on %q: %w", table, err)
+	}
+	for _, want := range expected {
+		found := false
+		for _, index := range indexes {
+			if index.unique && equalStringSlices(index.columns, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("table %q is missing required UNIQUE constraint on %v", table, want)
+		}
+	}
+	return nil
+}
+
+func validateForeignKeys(db *sql.DB, table string, expected []sqliteForeignKeyContract) error {
+	rows, err := db.Query("PRAGMA foreign_key_list(" + quoteSQLiteIdentifier(table) + ")")
+	if err != nil {
+		return fmt.Errorf("inspect foreign keys on %q: %w", table, err)
+	}
+	actual := make([]sqliteForeignKeyContract, 0)
+	for rows.Next() {
+		var id, seq int
+		var referenceTable, from, to, onUpdate, onDelete, match string
+		if err := rows.Scan(&id, &seq, &referenceTable, &from, &to, &onUpdate, &onDelete, &match); err != nil {
+			rows.Close()
+			return err
+		}
+		actual = append(actual, sqliteForeignKeyContract{from: from, to: to, table: referenceTable, onDelete: strings.ToLower(onDelete)})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if len(actual) != len(expected) {
+		return fmt.Errorf("table %q has %d foreign keys, want %d", table, len(actual), len(expected))
+	}
+	for _, want := range expected {
+		found := false
+		for _, got := range actual {
+			if strings.EqualFold(got.from, want.from) && strings.EqualFold(got.to, want.to) && strings.EqualFold(got.table, want.table) && strings.EqualFold(got.onDelete, want.onDelete) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("table %q is missing required foreign key %s -> %s.%s", table, want.from, want.table, want.to)
+		}
+	}
+	return nil
+}
+
+func validateChecks(db *sql.DB, table string, expected []string) error {
+	if len(expected) == 0 {
+		return nil
+	}
+	var createSQL string
+	if err := db.QueryRow("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&createSQL); err != nil {
+		return fmt.Errorf("read table definition %q: %w", table, err)
+	}
+	normalized := compactSQL(createSQL)
+	for _, check := range expected {
+		if !strings.Contains(normalized, compactSQL(check)) {
+			return fmt.Errorf("table %q is missing required CHECK constraint %q", table, check)
+		}
+	}
+	return nil
+}
+
+func validateIndex(db *sql.DB, expected sqliteIndexContract) error {
+	indexes, err := sqliteIndexes(db, expected.table)
+	if err != nil {
+		return fmt.Errorf("inspect index %q: %w", expected.name, err)
+	}
+	index, ok := indexes[expected.name]
+	if !ok {
+		return fmt.Errorf("table %q is missing required index %q", expected.table, expected.name)
+	}
+	if index.unique || !equalStringSlices(index.columns, expected.columns) {
+		return fmt.Errorf("index %q has unexpected definition", expected.name)
+	}
+	return nil
+}
+
+type sqliteIndexInfo struct {
+	unique  bool
+	columns []string
+}
+
+func sqliteIndexes(db *sql.DB, table string) (map[string]sqliteIndexInfo, error) {
+	rows, err := db.Query("PRAGMA index_list(" + quoteSQLiteIdentifier(table) + ")")
+	if err != nil {
+		return nil, err
+	}
+	type listedIndex struct {
+		name   string
+		unique bool
+	}
+	listed := make([]listedIndex, 0)
+	for rows.Next() {
+		var seq, unique, partial int
+		var origin string
+		var name string
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		listed = append(listed, listedIndex{name: name, unique: unique != 0})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	result := make(map[string]sqliteIndexInfo, len(listed))
+	for _, index := range listed {
+		indexRows, err := db.Query("PRAGMA index_info(" + quoteSQLiteIdentifier(index.name) + ")")
+		if err != nil {
+			return nil, err
+		}
+		columns := make([]string, 0)
+		for indexRows.Next() {
+			var seqno, cid int
+			var name sql.NullString
+			if err := indexRows.Scan(&seqno, &cid, &name); err != nil {
+				indexRows.Close()
+				return nil, err
+			}
+			if !name.Valid {
+				indexRows.Close()
+				return nil, fmt.Errorf("index %q contains an expression", index.name)
+			}
+			columns = append(columns, name.String)
+		}
+		if err := indexRows.Err(); err != nil {
+			indexRows.Close()
+			return nil, err
+		}
+		indexRows.Close()
+		result[index.name] = sqliteIndexInfo{unique: index.unique, columns: columns}
+	}
+	return result, nil
+}
+
+func equalStringSlices(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if !strings.EqualFold(left[index], right[index]) {
+			return false
+		}
+	}
+	return true
+}
+
+func compactSQL(value string) string {
+	return strings.Join(strings.Fields(strings.ToLower(value)), "")
+}
+
 func sortedSchemaTableNames(columns map[string][]string) []string {
 	tables := make([]string, 0, len(columns))
 	for table := range columns {
@@ -333,13 +704,19 @@ func sortedSchemaTableNames(columns map[string][]string) []string {
 	return tables
 }
 
-func sqliteTableColumns(db *sql.DB, table string) (map[string]struct{}, error) {
+type sqliteColumnInfo struct {
+	notNull      bool
+	defaultValue sql.NullString
+	primaryKey   int
+}
+
+func sqliteTableColumns(db *sql.DB, table string) (map[string]sqliteColumnInfo, error) {
 	rows, err := db.Query("PRAGMA table_info(" + quoteSQLiteIdentifier(table) + ")")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	columns := make(map[string]struct{})
+	columns := make(map[string]sqliteColumnInfo)
 	for rows.Next() {
 		var cid int
 		var name, columnType string
@@ -348,7 +725,7 @@ func sqliteTableColumns(db *sql.DB, table string) (map[string]struct{}, error) {
 		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
 			return nil, err
 		}
-		columns[name] = struct{}{}
+		columns[name] = sqliteColumnInfo{notNull: notNull != 0, defaultValue: defaultValue, primaryKey: primaryKey}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -388,6 +765,9 @@ func (s *Store) migrate() error {
 		return fmt.Errorf("database schema version %d is newer than this binary supports", version)
 	}
 	if version == currentSchemaVersion {
+		if err := validateSchemaContract(s.db, version); err != nil {
+			return fmt.Errorf("validate schema: %w", err)
+		}
 		return nil
 	}
 
@@ -507,6 +887,9 @@ PRAGMA user_version = 2;
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit schema migration: %w", err)
+	}
+	if err := validateSchemaContract(s.db, currentSchemaVersion); err != nil {
+		return fmt.Errorf("validate migrated schema: %w", err)
 	}
 	return nil
 }
