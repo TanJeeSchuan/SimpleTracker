@@ -38,6 +38,11 @@ The bootstrap command prints the secret once. Use it as `Authorization: Bearer <
 
 The versioned API is rooted at `/api/v1`: projects support create/list/read, and issues support create/list/read/update, Markdown bodies, comments, close, and reopen. The browser login is at `/login`; issue pages use `/projects/<slug>/issues/<number>`.
 
+The ready-to-copy adapter for Matt Pocock's engineering skills is
+[`docs/agents/issue-tracker.md`](docs/agents/issue-tracker.md). It defines the
+CLI/API mapping, labels, graph conventions, triage and Wayfinder workflows,
+stable references, and the non-atomic frontier-plus-assignment boundary.
+
 The CLI mirrors the API and always emits JSON:
 
 ```powershell
