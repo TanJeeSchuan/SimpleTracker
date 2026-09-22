@@ -251,17 +251,113 @@ func validateSQLiteBackup(path string) (int, error) {
 	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		return 0, err
 	}
-	if version > currentSchemaVersion {
-		return 0, fmt.Errorf("schema version %d is newer than this binary supports", version)
+	requiredTables, ok := requiredSchemaColumns(version)
+	if !ok {
+		if version > currentSchemaVersion {
+			return 0, fmt.Errorf("schema version %d is newer than this binary supports", version)
+		}
+		return 0, fmt.Errorf("backup has unsupported schema version %d", version)
 	}
-	var tables int
-	if err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('api_keys','projects','issues')").Scan(&tables); err != nil {
-		return 0, err
+	for _, table := range sortedSchemaTableNames(requiredTables) {
+		var tableType string
+		if err := db.QueryRow("SELECT type FROM sqlite_master WHERE name=? LIMIT 1", table).Scan(&tableType); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return 0, fmt.Errorf("backup is missing required table %q", table)
+			}
+			return 0, err
+		}
+		if tableType != "table" {
+			return 0, fmt.Errorf("backup object %q is %s, want table", table, tableType)
+		}
+		columns, err := sqliteTableColumns(db, table)
+		if err != nil {
+			return 0, fmt.Errorf("inspect table %q: %w", table, err)
+		}
+		for _, column := range requiredTables[table] {
+			if _, ok := columns[column]; !ok {
+				return 0, fmt.Errorf("backup table %q is missing required column %q", table, column)
+			}
+		}
 	}
-	if tables != 3 {
-		return 0, fmt.Errorf("backup does not contain the SimpleTracker schema")
+	rows, err := db.Query("PRAGMA foreign_key_check")
+	if err != nil {
+		return 0, fmt.Errorf("check backup foreign keys: %w", err)
 	}
+	if rows.Next() {
+		rows.Close()
+		return 0, fmt.Errorf("backup contains a foreign-key violation")
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, fmt.Errorf("read backup foreign-key check: %w", err)
+	}
+	rows.Close()
 	return version, nil
+}
+
+var schemaColumnsV1 = map[string][]string{
+	"api_keys":  {"id", "name", "secret_hash", "created_at", "last_used_at", "revoked_at"},
+	"projects":  {"id", "name", "slug", "created_at"},
+	"issues":    {"id", "project_id", "number", "title", "body", "state", "created_at", "updated_at", "closed_at", "creator_key_id", "creator_actor", "creator_session", "position"},
+	"comments":  {"id", "issue_id", "body", "created_at", "key_id", "actor", "session"},
+	"audit_log": {"id", "key_id", "actor", "session", "operation", "target_type", "target_id", "created_at", "details"},
+}
+
+var schemaColumnsV2 = map[string][]string{
+	"api_keys":       {"id", "name", "secret_hash", "created_at", "last_used_at", "revoked_at"},
+	"projects":       {"id", "name", "slug", "created_at"},
+	"issues":         {"id", "project_id", "number", "title", "body", "state", "created_at", "updated_at", "closed_at", "creator_key_id", "creator_actor", "creator_session", "position", "parent_id", "assignee", "assigned_key_id", "assigned_actor", "assigned_at"},
+	"comments":       {"id", "issue_id", "body", "created_at", "key_id", "actor", "session"},
+	"audit_log":      {"id", "key_id", "actor", "session", "operation", "target_type", "target_id", "created_at", "details"},
+	"issue_labels":   {"issue_id", "label", "created_at"},
+	"issue_blockers": {"issue_id", "blocker_id", "created_at"},
+}
+
+func requiredSchemaColumns(version int) (map[string][]string, bool) {
+	switch version {
+	case 1:
+		return schemaColumnsV1, true
+	case currentSchemaVersion:
+		return schemaColumnsV2, true
+	default:
+		return nil, false
+	}
+}
+
+func sortedSchemaTableNames(columns map[string][]string) []string {
+	tables := make([]string, 0, len(columns))
+	for table := range columns {
+		tables = append(tables, table)
+	}
+	sort.Strings(tables)
+	return tables
+}
+
+func sqliteTableColumns(db *sql.DB, table string) (map[string]struct{}, error) {
+	rows, err := db.Query("PRAGMA table_info(" + quoteSQLiteIdentifier(table) + ")")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	columns := make(map[string]struct{})
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, primaryKey int
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return nil, err
+		}
+		columns[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return columns, nil
+}
+
+func quoteSQLiteIdentifier(value string) string {
+	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
 }
 
 func sameFilePath(left, right string) bool {
