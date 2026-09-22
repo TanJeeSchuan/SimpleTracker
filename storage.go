@@ -768,8 +768,8 @@ func (s *Store) QueryIssues(ctx context.Context, filters IssueFilters) ([]Issue,
 		return nil, fmt.Errorf("invalid assigned filter %q", filters.Assigned)
 	}
 	if assignee := strings.TrimSpace(filters.Assignee); assignee != "" {
-		where = append(where, "(i.assignee=? OR i.assigned_actor=? OR i.assigned_key_id=?)")
-		args = append(args, assignee, assignee, assignee)
+		where = append(where, "i.assignee=?")
+		args = append(args, assignee)
 	}
 	if text := strings.TrimSpace(filters.Text); text != "" {
 		like := "%" + strings.ToLower(text) + "%"
