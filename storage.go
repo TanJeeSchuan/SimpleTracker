@@ -836,6 +836,12 @@ func (s *Store) hydrateIssue(ctx context.Context, issue *Issue) error {
 		}
 	}
 	issue.BlockedBy = issue.Blockers
+	issue.BlockedIssues, err = s.issueLinks(ctx, `SELECT i.id,i.project_id,p.slug,i.number,i.title,i.state,i.position
+			FROM issue_blockers ib JOIN issues i ON i.id=ib.issue_id JOIN projects p ON p.id=i.project_id
+			WHERE ib.blocker_id=? ORDER BY i.position,i.number,i.id`, issue.ID)
+	if err != nil {
+		return err
+	}
 	issue.Children, err = s.issueLinks(ctx, `SELECT c.id,c.project_id,p.slug,c.number,c.title,c.state,c.position
 		FROM issues c JOIN projects p ON p.id=c.project_id WHERE c.parent_id=? ORDER BY c.position,c.number,c.id`, issue.ID)
 	return err

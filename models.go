@@ -46,6 +46,7 @@ type Issue struct {
 	Blocked        bool        `json:"blocked"`
 	Blockers       []IssueLink `json:"blockers,omitempty"`
 	BlockedBy      []IssueLink `json:"blocked_by,omitempty"`
+	BlockedIssues  []IssueLink `json:"blocked_issues,omitempty"`
 	Children       []IssueLink `json:"children,omitempty"`
 }
 

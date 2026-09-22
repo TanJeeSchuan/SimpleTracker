@@ -750,7 +750,7 @@ func (s *Server) issueBlockers(w http.ResponseWriter, r *http.Request, issue Iss
 		return
 	}
 	if r.Method == http.MethodGet && len(suffix) == 0 {
-		writeJSON(w, http.StatusOK, map[string]any{"blockers": issue.Blockers, "blocked": issue.Blocked})
+		writeJSON(w, http.StatusOK, map[string]any{"blockers": issue.Blockers, "blocked": issue.Blocked, "blocked_issues": issue.BlockedIssues})
 		return
 	}
 	var input struct {
@@ -904,6 +904,28 @@ func (s *Server) browser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	parts := splitPath(strings.TrimPrefix(r.URL.Path, "/"))
+	if len(parts) == 2 && parts[0] == "projects" {
+		if _, ok := s.browserAuth(r); !ok {
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			return
+		}
+		project, err := s.Store.GetProject(r.Context(), parts[1])
+		if errors.Is(err, ErrNotFound) {
+			writeHTML(w, http.StatusNotFound, "<h1>Project not found</h1>")
+			return
+		}
+		if err != nil {
+			writeHTML(w, http.StatusInternalServerError, "<h1>Storage error</h1>")
+			return
+		}
+		issues, err := s.Store.QueryIssues(r.Context(), IssueFilters{ProjectID: project.ID})
+		if err != nil {
+			writeHTML(w, http.StatusInternalServerError, "<h1>Storage error</h1>")
+			return
+		}
+		writeHTML(w, http.StatusOK, renderProjectBoard(project, issues))
+		return
+	}
 	if len(parts) == 4 && parts[0] == "projects" && parts[2] == "issues" && isNumber(parts[3]) {
 		if _, ok := s.browserAuth(r); !ok {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
@@ -918,7 +940,7 @@ func (s *Server) browser(w http.ResponseWriter, r *http.Request) {
 			writeHTML(w, http.StatusInternalServerError, "<h1>Storage error</h1>")
 			return
 		}
-		writeHTML(w, http.StatusOK, renderIssuePage(issue))
+		writeHTML(w, http.StatusOK, renderInteractiveIssuePage(issue))
 		return
 	}
 	writeHTML(w, http.StatusNotFound, "<h1>Not found</h1>")
@@ -944,58 +966,16 @@ var loginPageWithError = `<!doctype html><meta charset="utf-8"><title>SimpleTrac
 
 func renderProjectIndex(projects []Project) string {
 	var b strings.Builder
-	b.WriteString(`<!doctype html><meta charset="utf-8"><title>SimpleTracker</title><style>body{font:16px system-ui;max-width:56rem;margin:3rem auto;padding:1rem}a{color:#1769aa}.project{padding:1rem;border:1px solid #ddd;border-radius:.5rem;margin:.5rem 0}</style><h1>Projects</h1>`)
+	b.WriteString(`<!doctype html><meta charset="utf-8"><title>SimpleTracker</title><style>body{font:16px system-ui;max-width:56rem;margin:3rem auto;padding:1rem}a{color:#1769aa}.project{padding:1rem;border:1px solid #ddd;border-radius:.5rem;margin:.5rem 0}.project a{display:block;text-decoration:none;color:inherit}</style><h1>Projects</h1>`)
 	if len(projects) == 0 {
 		b.WriteString("<p>No projects yet.</p>")
 	}
 	for _, project := range projects {
-		b.WriteString(`<div class="project"><strong>` + template.HTMLEscapeString(project.Name) + `</strong> <code>` + template.HTMLEscapeString(project.Slug) + `</code></div>`)
+		b.WriteString(`<div class="project"><a href="/projects/` + template.HTMLEscapeString(url.PathEscape(project.Slug)) + `"><strong>` + template.HTMLEscapeString(project.Name) + `</strong> <code>` + template.HTMLEscapeString(project.Slug) + `</code><small> Open swimlane board →</small></a></div>`)
 	}
 	return b.String()
 }
 
 func renderIssuePage(issue Issue) string {
-	var b strings.Builder
-	b.WriteString(`<!doctype html><meta charset="utf-8"><title>` + template.HTMLEscapeString(issue.Title) + ` · SimpleTracker</title><style>body{font:16px system-ui;max-width:56rem;margin:3rem auto;padding:1rem;color:#20242a}article{border:1px solid #ddd;border-radius:.6rem;padding:1.5rem}pre{white-space:pre-wrap;background:#f6f7f9;padding:1rem;border-radius:.4rem}.meta{color:#64707d;font-size:.9rem}</style><p><a href="/">Projects</a> / ` + template.HTMLEscapeString(issue.ProjectSlug) + `</p><article><h1>#` + strconv.FormatInt(issue.Number, 10) + ` ` + template.HTMLEscapeString(issue.Title) + `</h1><p class="meta">` + template.HTMLEscapeString(issue.State) + ` · updated ` + template.HTMLEscapeString(issue.UpdatedAt.Format(time.RFC3339)) + `</p><pre>` + template.HTMLEscapeString(issue.Body) + `</pre>`)
-	meta := []string{issue.State}
-	if issue.Blocked {
-		meta = append(meta, "blocked")
-	} else {
-		meta = append(meta, "unblocked")
-	}
-	if issue.Assignee != "" {
-		meta = append(meta, "assigned to "+issue.Assignee)
-	} else {
-		meta = append(meta, "unassigned")
-	}
-	meta = append(meta, "updated "+issue.UpdatedAt.Format(time.RFC3339))
-	b.WriteString(`<p class="meta">` + template.HTMLEscapeString(strings.Join(meta, " - ")) + `</p>`)
-	if issue.ParentID != "" {
-		b.WriteString(`<p class="meta">Parent: <code>` + template.HTMLEscapeString(issue.ParentID) + `</code></p>`)
-	}
-	if len(issue.Labels) > 0 {
-		b.WriteString(`<p class="meta">Labels: ` + template.HTMLEscapeString(strings.Join(issue.Labels, ", ")) + `</p>`)
-	}
-	if len(issue.Blockers) > 0 {
-		b.WriteString(`<h2>Blockers</h2><ul>`)
-		for _, blocker := range issue.Blockers {
-			b.WriteString(`<li>#` + strconv.FormatInt(blocker.Number, 10) + ` ` + template.HTMLEscapeString(blocker.Title) + ` (` + template.HTMLEscapeString(blocker.State) + `)</li>`)
-		}
-		b.WriteString(`</ul>`)
-	}
-	if len(issue.Children) > 0 {
-		b.WriteString(`<h2>Children</h2><ul>`)
-		for _, child := range issue.Children {
-			b.WriteString(`<li>#` + strconv.FormatInt(child.Number, 10) + ` ` + template.HTMLEscapeString(child.Title) + ` (` + template.HTMLEscapeString(child.State) + `)</li>`)
-		}
-		b.WriteString(`</ul>`)
-	}
-	if len(issue.Comments) > 0 {
-		b.WriteString("<h2>Comments</h2>")
-		for _, comment := range issue.Comments {
-			b.WriteString(`<section><p class="meta">` + template.HTMLEscapeString(comment.Actor) + ` · ` + template.HTMLEscapeString(comment.CreatedAt.Format(time.RFC3339)) + `</p><pre>` + template.HTMLEscapeString(comment.Body) + `</pre></section>`)
-		}
-	}
-	b.WriteString("</article>")
-	return b.String()
+	return renderInteractiveIssuePage(issue)
 }
